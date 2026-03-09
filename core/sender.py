@@ -22,6 +22,8 @@ from .data import (
     GraphicsContent,
     ImageContent,
     ParseResult,
+    SendGroup,
+    TextContent,
     VideoContent,
 )
 from .exception import (
@@ -57,7 +59,18 @@ class MessageSender:
             path = path.resolve()
         return path.as_uri()
 
-    def _build_send_plan(self, result: ParseResult) -> dict:
+    @staticmethod
+    def _iter_contents(result: ParseResult):
+        return chain(result.contents, result.repost.contents if result.repost else ())
+
+    def _build_send_plan(
+        self,
+        result: ParseResult,
+        contents: list | tuple | None = None,
+        *,
+        force_merge_override: bool | None = None,
+        render_card_override: bool | None = None,
+    ) -> dict:
         """
         根据解析结果生成发送计划（plan）
 
@@ -67,11 +80,10 @@ class MessageSender:
         light, heavy = [], []
 
         # 合并主内容 + 转发内容，统一参与发送策略计算
-        for cont in chain(
-            result.contents, result.repost.contents if result.repost else ()
-        ):
+        iterable = contents if contents is not None else self._iter_contents(result)
+        for cont in iterable:
             match cont:
-                case ImageContent() | GraphicsContent():
+                case ImageContent() | GraphicsContent() | TextContent():
                     light.append(cont)
                 case VideoContent() | AudioContent() | FileContent() | DynamicContent():
                     heavy.append(cont)
@@ -81,11 +93,15 @@ class MessageSender:
         # 仅在“单一重媒体且无其他内容”时，才允许渲染卡片
         is_single_heavy = len(heavy) == 1 and not light
         render_card = is_single_heavy and self.cfg.single_heavy_render_card
+        if render_card_override is not None:
+            render_card = render_card_override
         # 实际消息段数量（卡片也算一个段）
         seg_count = len(light) + len(heavy) + (1 if render_card else 0)
 
         # 达到阈值后，强制合并转发，避免刷屏
         force_merge = seg_count >= self.cfg.forward_threshold
+        if force_merge_override is not None:
+            force_merge = force_merge_override
 
         return {
             "light": light,
@@ -137,6 +153,11 @@ class MessageSender:
 
         # 轻媒体处理
         for cont in plan["light"]:
+            if isinstance(cont, TextContent):
+                if cont.text:
+                    segs.append(Plain(cont.text))
+                continue
+
             try:
                 path: Path = await cont.get_path()
             except (DownloadLimitException, ZeroSizeException):
@@ -209,6 +230,53 @@ class MessageSender:
         return [nodes]
 
     @staticmethod
+    def _build_text_fallback(result: ParseResult) -> list[BaseMessageComponent]:
+        lines: list[str] = []
+        if result.header:
+            lines.append(result.header)
+        if result.text:
+            lines.append(result.text)
+        elif result.extra.get("info"):
+            lines.append(str(result.extra["info"]))
+
+        text = "\n".join(line for line in lines if line).strip()
+        return [Plain(text)] if text else []
+
+    def _resolve_groups(result: ParseResult) -> list[SendGroup]:
+        if result.send_groups:
+            return result.send_groups
+        return [SendGroup(contents=list(MessageSender._iter_contents(result)))]
+
+    async def _send_group(
+        self,
+        event: AstrMessageEvent,
+        result: ParseResult,
+        group: SendGroup,
+    ) -> bool:
+        plan = self._build_send_plan(
+            result,
+            group.contents,
+            force_merge_override=group.force_merge,
+            render_card_override=group.render_card,
+        )
+
+        await self._send_preview_card(event, result, plan)
+
+        segs = await self._build_segments(result, plan)
+        segs = self._merge_segments_if_needed(event, segs, plan["force_merge"])
+
+        if not segs:
+            return False
+
+        try:
+            await event.send(event.chain_result(segs))
+            return True
+        except Exception as e:
+            seg_meta = self._collect_seg_meta(segs)
+            logger.error(f"发送解析结果失败： error={e}, segments={seg_meta}")
+            return False
+
+    @staticmethod
     def _collect_seg_meta(segs: list[BaseMessageComponent]) -> list[dict[str, str]]:
         """提取消息段元信息，用于失败日志定位。"""
         meta: list[dict[str, str]] = []
@@ -239,19 +307,21 @@ class MessageSender:
         4. 必要时合并转发
         5. 最终发送
         """
-        plan = self._build_send_plan(result)
+        groups = self._resolve_groups(result)
 
-        await self._send_preview_card(event, result, plan)
+        sent = False
+        for group in groups:
+            sent = await self._send_group(event, result, group) or sent
 
-        segs = await self._build_segments(result, plan)
-        segs = self._merge_segments_if_needed(event, segs, plan["force_merge"])
+        if not sent:
+            segs = self._build_text_fallback(result)
+            if not segs:
+                logger.warning("发送结果为空，不执行发送")
+                return
 
-        if not segs:
-            logger.warning("发送结果为空，不执行发送")
+            try:
+                await event.send(event.chain_result(segs))
+            except Exception as e:
+                seg_meta = self._collect_seg_meta(segs)
+                logger.error(f"发送解析结果失败： error={e}, segments={seg_meta}")
             return
-
-        try:
-            await event.send(event.chain_result(segs))
-        except Exception as e:
-            seg_meta = self._collect_seg_meta(segs)
-            logger.error(f"发送解析结果失败： error={e}, segments={seg_meta}")
